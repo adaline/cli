@@ -39,6 +39,9 @@ if ($arch -ne 'AMD64' -and $arch -ne 'ARM64') {
     Fail "unsupported architecture '$arch' - see https://github.com/$Repo/releases for available binaries"
 }
 $asset = "$BinName-windows-x64.exe"
+# Published assets are gzipped (the embedded Bun runtime is large but compresses
+# well); download the .gz and inflate it locally with .NET's GZipStream.
+$dlAsset = "$asset.gz"
 
 # --- resolve download URLs ---------------------------------------------------
 $version = if ($env:ADALINE_VERSION) { $env:ADALINE_VERSION } else { 'latest' }
@@ -53,39 +56,65 @@ if ($version -eq 'latest') {
     $base  = "https://github.com/$Repo/releases/download/$tag"
     $label = $tag
 }
-$assetUrl = "$base/$asset"
+$assetUrl = "$base/$dlAsset"
 $sumsUrl  = "$base/SHA256SUMS"
 
 Write-Info "Installing $BinName (windows/x64, $label)"
 
 # --- download into a temp file ----------------------------------------------
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("adaline-" + [System.Guid]::NewGuid().ToString('N'))
+$tmpGz  = "$tmp.gz"
 $tmpBin = "$tmp.exe"
 try {
-    Write-Info "Downloading $assetUrl"
+    Write-Info "Downloading $assetUrl ..."
     try {
-        Invoke-WebRequest -Uri $assetUrl -OutFile $tmpBin -UseBasicParsing
+        # Suppress Invoke-WebRequest's built-in progress bar: in Windows
+        # PowerShell 5.1 it re-renders per chunk and can slow the transfer
+        # several-fold. We print our own concise before/after status instead.
+        $savedProgress = $ProgressPreference
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri $assetUrl -OutFile $tmpGz -UseBasicParsing
     } catch {
         Fail "download failed - is '$label' a published release? ($($_.Exception.Message))"
+    } finally {
+        $ProgressPreference = $savedProgress
     }
+    $dlMB = [math]::Round((Get-Item $tmpGz).Length / 1MB, 1)
+    Write-Info "downloaded $dlMB MB"
 
     # --- verify checksum (best-effort) ---------------------------------------
+    # Hash the downloaded .gz (what we fetched), matching its SHA256SUMS entry.
     try {
         $sums = (Invoke-WebRequest -Uri $sumsUrl -UseBasicParsing).Content
         $expected = $null
         foreach ($line in $sums -split "`n") {
             $parts = ($line.Trim() -split '\s+', 2)
-            if ($parts.Count -eq 2 -and $parts[1] -eq $asset) { $expected = $parts[0].ToLower() }
+            if ($parts.Count -eq 2 -and $parts[1] -eq $dlAsset) { $expected = $parts[0].ToLower() }
         }
         if ($expected) {
-            $actual = (Get-FileHash -Path $tmpBin -Algorithm SHA256).Hash.ToLower()
-            if ($actual -ne $expected) { Fail "checksum mismatch for $asset (expected $expected, got $actual)" }
+            $actual = (Get-FileHash -Path $tmpGz -Algorithm SHA256).Hash.ToLower()
+            if ($actual -ne $expected) { Fail "checksum mismatch for $dlAsset (expected $expected, got $actual)" }
             Write-Info "checksum verified"
         } else {
-            Write-Warn "could not fetch checksum for $asset - skipping verification"
+            Write-Warn "could not fetch checksum for $dlAsset - skipping verification"
         }
     } catch {
         Write-Warn "could not verify checksum - skipping verification"
+    }
+
+    # --- decompress ----------------------------------------------------------
+    $inStream = $null; $gzStream = $null; $outStream = $null
+    try {
+        $inStream  = [System.IO.File]::OpenRead($tmpGz)
+        $gzStream  = New-Object System.IO.Compression.GZipStream($inStream, [System.IO.Compression.CompressionMode]::Decompress)
+        $outStream = [System.IO.File]::Create($tmpBin)
+        $gzStream.CopyTo($outStream)
+    } catch {
+        Fail "failed to decompress $dlAsset ($($_.Exception.Message))"
+    } finally {
+        if ($outStream) { $outStream.Dispose() }
+        if ($gzStream)  { $gzStream.Dispose() }
+        if ($inStream)  { $inStream.Dispose() }
     }
 
     # --- install -------------------------------------------------------------
@@ -103,6 +132,7 @@ try {
     Write-Info "installed $BinName $installedVersion -> $dest"
     Write-Info "  also available as $AliasName"
 } finally {
+    if (Test-Path $tmpGz)  { Remove-Item -Force $tmpGz  -ErrorAction SilentlyContinue }
     if (Test-Path $tmpBin) { Remove-Item -Force $tmpBin -ErrorAction SilentlyContinue }
 }
 

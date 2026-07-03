@@ -35,10 +35,21 @@ err()  { printf '%serror:%s %s\n' "$red" "$reset" "$*" >&2; exit 1; }
 
 # --- prerequisites -----------------------------------------------------------
 # Prefer curl, fall back to wget — at least one ships on virtually every box.
+# DL      → fetch small files (SHA256SUMS) to stdout, always silent.
+# DL_OUT  → download the binary to a file; show a progress bar on a real
+#           terminal so the ~25 MB transfer isn't a silent multi-second pause,
+#           but stay quiet when piped/non-interactive (CI logs, `| sh`).
 if command -v curl >/dev/null 2>&1; then
-  DL='curl -fsSL'; DL_OUT='curl -fsSL -o'
+  DL='curl -fsSL'
+  if [ -t 2 ]; then DL_OUT='curl -fL --progress-bar -o'; else DL_OUT='curl -fsSL -o'; fi
 elif command -v wget >/dev/null 2>&1; then
-  DL='wget -qO-'; DL_OUT='wget -qO'
+  DL='wget -qO-'
+  # --show-progress needs a non-busybox wget; fall back to fully quiet otherwise.
+  if [ -t 2 ] && wget --help 2>&1 | grep -q -- '--show-progress'; then
+    DL_OUT='wget -q --show-progress -O'
+  else
+    DL_OUT='wget -qO'
+  fi
 else
   err "need curl or wget installed to download the CLI"
 fi
@@ -57,6 +68,9 @@ case "$arch" in
   *) err "unsupported architecture '$arch' — see https://github.com/$REPO/releases for available binaries" ;;
 esac
 asset="${BIN_NAME}-${os}-${arch}"
+# We publish gzipped binaries (the embedded Bun runtime is huge but compresses
+# well); download the .gz and inflate it locally.
+dl_asset="${asset}.gz"
 
 # --- resolve the download URLs ----------------------------------------------
 if [ "${ADALINE_VERSION:-latest}" = "latest" ]; then
@@ -75,7 +89,7 @@ fi
 if [ -n "${ADALINE_DOWNLOAD_BASE:-}" ]; then
   base="$ADALINE_DOWNLOAD_BASE"
 fi
-asset_url="$base/$asset"
+asset_url="$base/$dl_asset"
 sums_url="$base/SHA256SUMS"
 
 info "${bold}Installing $BIN_NAME${reset} ${dim}($os/$arch, $label)${reset}"
@@ -83,28 +97,38 @@ info "${bold}Installing $BIN_NAME${reset} ${dim}($os/$arch, $label)${reset}"
 # --- download into a temp dir we always clean up -----------------------------
 tmp="$(mktemp -d 2>/dev/null || mktemp -d -t adaline)"
 trap 'rm -rf "$tmp"' EXIT INT TERM
+tmp_dl="$tmp/$dl_asset"
 tmp_bin="$tmp/$asset"
 
 info "${dim}Downloading $asset_url${reset}"
 # shellcheck disable=SC2086
-$DL_OUT "$tmp_bin" "$asset_url" || err "download failed — is '$label' a published release for $os/$arch?"
+$DL_OUT "$tmp_dl" "$asset_url" || err "download failed — is '$label' a published release for $os/$arch?"
 
 # --- verify checksum (best-effort: skip if SHA256SUMS is absent) -------------
+# We hash the downloaded .gz (what we fetched), matching the SHA256SUMS entry.
 if sha_cmd="$(command -v sha256sum || command -v shasum || true)" && [ -n "$sha_cmd" ]; then
   # shellcheck disable=SC2086
-  if expected="$($DL "$sums_url" 2>/dev/null | awk -v a="$asset" '$2==a {print $1}')" && [ -n "$expected" ]; then
+  if expected="$($DL "$sums_url" 2>/dev/null | awk -v a="$dl_asset" '$2==a {print $1}')" && [ -n "$expected" ]; then
     case "$sha_cmd" in
-      *shasum) actual="$(shasum -a 256 "$tmp_bin" | awk '{print $1}')" ;;
-      *) actual="$(sha256sum "$tmp_bin" | awk '{print $1}')" ;;
+      *shasum) actual="$(shasum -a 256 "$tmp_dl" | awk '{print $1}')" ;;
+      *) actual="$(sha256sum "$tmp_dl" | awk '{print $1}')" ;;
     esac
-    [ "$actual" = "$expected" ] || err "checksum mismatch for $asset (expected $expected, got $actual)"
+    [ "$actual" = "$expected" ] || err "checksum mismatch for $dl_asset (expected $expected, got $actual)"
     info "${green}✓${reset} checksum verified"
   else
-    warn "could not fetch checksum for $asset — skipping verification"
+    warn "could not fetch checksum for $dl_asset — skipping verification"
   fi
 else
   warn "no sha256 tool found — skipping checksum verification"
 fi
+
+# --- decompress --------------------------------------------------------------
+if ! command -v gunzip >/dev/null 2>&1 && ! command -v gzip >/dev/null 2>&1; then
+  err "failed to decompress $dl_asset — need gunzip or gzip installed"
+fi
+gunzip -c "$tmp_dl" > "$tmp_bin" \
+  || gzip -dc "$tmp_dl" > "$tmp_bin" \
+  || err "failed to decompress $dl_asset — the downloaded file may be corrupt"
 
 # --- install -----------------------------------------------------------------
 mkdir -p "$INSTALL_DIR" || err "cannot create install dir $INSTALL_DIR"
